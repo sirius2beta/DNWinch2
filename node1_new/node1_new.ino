@@ -2,10 +2,16 @@
 #include <AccelStepper.h>
 #include "HX711.h"
 
-// UART2 設定
+// UART1 連接aqua
+#define UART1_TX 1
+#define UART1_RX 22
+// UART2 連接master
 #define UART2_TX 17
 #define UART2_RX 16
-HardwareSerial RS485(2);
+#define slave_addr 0x12
+
+HardwareSerial Aqua(2);
+HardwareSerial MainBus(2)
 
 // mutex
 SemaphoreHandle_t node0Mutex;
@@ -21,7 +27,8 @@ int motorAcc      = 200;
 
 
 // 秤重感測器
-#define HX711_DT  26   // DOUT     
+#define HX711_DT  26   // DOUT   
+#define HX711_SCK 27 // or other suitable GPIO  
 HX711 scale;
 
 // 狀態
@@ -30,48 +37,46 @@ int32_t currentTension = 0;
 bool motorRunning = false;
 
 // -----------------------------
-// CRC8 計算 (MSB-first, poly 0x07)
+// CRC16 計算
 // -----------------------------
-uint8_t crc8(const uint8_t *data, size_t len) {
-  uint8_t crc = 0;
-  while (len--) {
-    crc ^= *data++;
-    for (int i = 0; i < 8; i++) {
-      if (crc & 0x80)
-        crc = (crc << 1) ^ 0x07;
-      else
-        crc <<= 1;
+uint16_t crc16(const uint8_t *data, uint16_t len) {
+    uint16_t crc = 0xFFFF;
+    for (uint16_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (uint8_t j = 0; j < 8; j++) {
+            if (crc & 0x0001) crc = (crc >> 1) ^ 0xA001;
+            else crc = crc >> 1;
+        }
     }
-  }
-  return crc;
+    return crc;
 }
-
-
-
 
 
 // -----------------------------
 // 封包接收與解析
 // -----------------------------
 #define PKT_BUF_SIZE 128
-uint8_t pktBuf[PKT_BUF_SIZE];
-int pktIndex = 0;
+uint8_t buff1[PKT_BUF_SIZE]; //UART1 buffer
+int buff1Len = 0;
+uint8_t buff2[PKT_BUF_SIZE]; //UART2 buffer
+int buff2Len = 0;
 int expectedLen = -1;
 
 void processPacket(uint8_t *payload, int len) {
   if (len < 1) return;
-  uint8_t cmd = payload[0];
+  if (payload[0] != slave_addr) return;
+  uint8_t cmd = payload[1];
   if (xSemaphoreTake(node0Mutex, portMAX_DELAY)) {
     switch (cmd) {
-      case 0x00: // reset highest point
+      case 0x20: // reset highest point
         stepper.setCurrentPosition(0);
         Serial.println("[CMD] Reset highest point");
         break;
   
-      case 0x01: // set speed & acc
-        if (len >= 5) {
-          int16_t spd = (int16_t)((payload[1] << 8) | payload[2]);
-          int16_t acc = (int16_t)((payload[3] << 8) | payload[4]);
+      case 0x21: // set speed & acc
+        if (len >= 6) {
+          int16_t spd = (int16_t)((payload[2] << 8) | payload[3]);
+          int16_t acc = (int16_t)((payload[4] << 8) | payload[5]);
           motorMaxSpeed = spd;
           motorAcc = acc;
           stepper.setMaxSpeed(motorMaxSpeed);
@@ -80,55 +85,55 @@ void processPacket(uint8_t *payload, int len) {
         }
         break;
   
-      case 0x02: // set step
-        if (len >= 5) {
-          int32_t step = ((int32_t)payload[1] << 24) | ((int32_t)payload[2] << 16) | ((int32_t)payload[3] << 8) | (int32_t)payload[4];
+      case 0x22: // set step
+        if (len >= 6) {
+          int32_t step = ((int32_t)payload[2] << 24) | ((int32_t)payload[3] << 16) | ((int32_t)payload[4] << 8) | (int32_t)payload[5];
           stepper.moveTo(step);
           motorRunning = true;
           Serial.printf("[CMD] Move to step=%ld\n", step);
         }
         break;
   
-      case 0x03: // stop
+      case 0x023: // stop
         stepper.setCurrentPosition(stepper.currentPosition());
         motorRunning = false;
         Serial.println("[CMD] Stop");
         break;
   
-      case 0x04: { // get status
-        uint8_t resp[1 + 4 + 4 + 1]; // cmd + step + tension + running
-        resp[0] = 0x04;
+      case 0x24: { // get status
+        uint8_t resp[1 + 1 + 4 + 4 + 1]; // addr + cmd + step + tension + running
+        resp[0] = slave_addr;
+        resp[1] = 0x04;
         int32_t step = stepper.currentPosition();
-        resp[1] = (step >> 24) & 0xFF;
-        resp[2] = (step >> 16) & 0xFF;
-        resp[3] = (step >> 8) & 0xFF;
-        resp[4] = step & 0xFF;
-        resp[5] = (currentTension >> 24) & 0xFF;
-        resp[6] = (currentTension >> 16) & 0xFF;
-        resp[7] = (currentTension >> 8) & 0xFF;
-        resp[8] = currentTension & 0xFF;
-        resp[9] = motorRunning ? 1 : 0;
+        resp[2] = (step >> 24) & 0xFF;
+        resp[3] = (step >> 16) & 0xFF;
+        resp[4] = (step >> 8) & 0xFF;
+        resp[5] = step & 0xFF;
+        resp[6] = (currentTension >> 24) & 0xFF;
+        resp[7] = (currentTension >> 16) & 0xFF;
+        resp[8] = (currentTension >> 8) & 0xFF;
+        resp[9] = currentTension & 0xFF;
+        resp[10] = motorRunning ? 1 : 0;
   
         // 封包回傳
-        // 注意：這邊使用修正過的 sendPacket
         sendPacket(resp, sizeof(resp));
         Serial.println("Reply 0x04 sent");
         break;
       }
   
-      case 0x05: // set tension threshold
-        if (len >= 5) {
-          int32_t tension = ((int32_t)payload[1] << 24) | ((int32_t)payload[2] << 16) | ((int32_t)payload[3] << 8) | (int32_t)payload[4];
+      case 0x25: // set tension threshold
+        if (len >= 6) {
+          int32_t tension = ((int32_t)payload[2] << 24) | ((int32_t)payload[3] << 16) | ((int32_t)payload[4] << 8) | (int32_t)payload[5];
           Serial.printf("[CMD] Set tension threshold=%ld\n", tension);
         }
         break;
   
-      case 0x06: // reset pos = 0
+      case 0x26: // reset pos = 0
         stepper.setCurrentPosition(0);
         Serial.println("[CMD] Reset pos=0");
         break;
   
-      case 0x07: // get aqua cached data
+      case 0x27: // get aqua cached data
         Serial.println("[CMD] Get Aqua data");
         //replyAquaSnapshotToNode0();
         Serial.println("Node0: CMD 0x07 sent aqua snapshot");
@@ -150,80 +155,55 @@ void processPacket(uint8_t *payload, int len) {
 void sendPacket(uint8_t *payload, int len) {
   if (len < 0 || len > (PKT_BUF_SIZE - 3)) return;
   uint8_t buf[PKT_BUF_SIZE];
-  buf[0] = 0xAA;
-  buf[1] = (uint8_t)len;
-  memcpy(&buf[2], payload, len);
-  uint8_t crcVal = crc8(&buf[1], len + 1); // LEN + PAYLOAD
-  buf[2 + len] = crcVal;
+  memcpy(&buf[0], payload, len);
+  uint16_t crc_calc = crc16(&buf[0], len); // LEN + PAYLOAD
+  buf[len] = crc_calc & 0xFF;        // CRC Lo
+  buf[1 + len] = (crc_calc >> 8) & 0xFF; // CRC Hi
 
   // Debug: 列印要送出的 raw bytes
   Serial.print("📤 Send: ");
-  for (int i = 0; i < len + 3; i++) {
+  for (int i = 0; i < len + 2; i++) {
     Serial.printf("%02X ", buf[i]);
   }
   Serial.println();
 
   // 正確寫出 header + len + payload + crc (len + 3 bytes)
-  RS485.write(buf, len + 3);
+  MainBus.write(buf, len + 2);
 }
 
 // -----------------------------
 // UART 接收處理 (含 debug)
 // -----------------------------
 void handleUART() {
-  while (RS485.available()) {
-    uint8_t b = RS485.read();
-
-    // 如果一開始不是 header，跳過直到遇到 0xAA
-    if (pktIndex == 0 && b != 0xAA) {
-      continue;
+  while (MainBus.available()) {
+    buff2[buff2Len++] = MainBus.read();
+  }
+  if(buff2Len > 0){
+    if(buff2[0] == slave_addr){
+      Serial.println("got data");
     }
+    //validate CRC16
+    if(buff2Len >= 4){ // 
+      uint16_t crc_calc = crc16(buff2, buff2Len-2);
+      uint16_t crc_recv = buff2[buff2Len-2] | (buff2[buff2Len-1] << 8);
 
-    // 防止溢位
-    if (pktIndex >= PKT_BUF_SIZE) {
-      pktIndex = 0;
-      expectedLen = -1;
-      Serial.println("pktBuf overflow, reset");
-      continue;
-    }
-
-    pktBuf[pktIndex++] = b;
-
-    if (pktIndex == 2) {
-      expectedLen = pktBuf[1];
-      // sanity check
-      if (expectedLen < 0 || expectedLen > (PKT_BUF_SIZE - 3)) {
-        Serial.printf("Invalid len %d, reset\n", expectedLen);
-        pktIndex = 0;
-        expectedLen = -1;
-        continue;
+      if(crc_calc != crc_recv){
+        Serial.println("X check CRC16 failed");
+        Serial.print("Recv: ");
+        for(int i=0; i<buff2Len; i++){
+          Serial.print(buff2[i], HEX);
+          Serial.print(" ");
+        }
+        Serial.println();
+      } else{
+        processPacket(buff2, buff2Len);
       }
-    }
-
-    if (expectedLen >= 0 && pktIndex == expectedLen + 3) {
-      // calc CRC over LEN + PAYLOAD
-      uint8_t calcCrc = crc8(&pktBuf[1], expectedLen + 1);
-      uint8_t recvCrc = pktBuf[pktIndex - 1];
-
-      // debug: 列印收到的 raw bytes
-      Serial.print("📥 Recv: ");
-      for (int i = 0; i < pktIndex; i++) Serial.printf("%02X ", pktBuf[i]);
-      Serial.println();
-      Serial.printf("calcCrc=%02X recvCrc=%02X\n", calcCrc, recvCrc);
-
-      if (calcCrc == recvCrc) {
-        processPacket(&pktBuf[2], expectedLen);
-      } else {
-        Serial.println("CRC error");
-      }
-      pktIndex = 0;
-      expectedLen = -1;
+      buff2Len = 0; // 在成功處理後清除
     }
   }
+  
+
 }
-
-
-
 
 // -----------------------------
 // Node0 UART2 command parsing task
@@ -239,15 +219,15 @@ void node0Task(void *pv) {
 
 void setup() {
   Serial.begin(115200);
-  RS485.begin(115200, SERIAL_8E1, UART2_RX, UART2_TX);
+  Aqua.begin(19200, SERIAL_8E1, UART1_RX, UART1_TX);
+  MainBus.begin(19200, SERIAL_8E1, UART2_RX, UART2_TX);
 
   stepper.setMaxSpeed(motorMaxSpeed);
   stepper.setAcceleration(motorAcc);
 
   scale.begin(HX711_DT, HX711_SCK);
   Serial.println("HX711 ready");
-
-
+  
   node0Mutex = xSemaphoreCreateMutex();
   xTaskCreatePinnedToCore(node0Task, "node0Task", 4096, NULL, 1, NULL, 1);
 }
