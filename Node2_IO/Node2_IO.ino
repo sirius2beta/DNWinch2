@@ -38,7 +38,6 @@ void loop() {
   while (mySerial.available() && len < sizeof(buff)) {
     uint8_t b = mySerial.read();
     buff[len++] = b;
-    Serial.printf("Got byte: 0x%02X\n", b);
     lastRecvTime = millis();
   }
 
@@ -50,11 +49,7 @@ void loop() {
 
   // 只有在資料至少 4 bytes 才開始處理
   if (len >= 4) {
-    if (buff[0] != slave_addr) {
-      len = 0;
-      while (mySerial.available()) mySerial.read();
-      return;
-    }
+    
 
     uint8_t function_code = buff[1];
     int expected_len = 0;
@@ -63,8 +58,25 @@ void loop() {
       expected_len = 4;
     } else if (function_code == 0x05) {
       expected_len = 8;
+    }else if(function_code == 0x06){
+      expected_len = 8;
+    }else if (function_code == 0x10) {
+      // 必須至少收到前 7 bytes，才知道後面還要收多少
+      if (len >= 7) {
+        uint8_t byte_count = buff[6];
+        expected_len = 7 + byte_count + 2; // header + data + CRC
+      } else {
+        // 還沒收到完整 header，等下一輪再處理
+        return;
+      }
     } else {
       Serial.printf("Unsupported function code: 0x%02X\n", function_code);
+      // 印出封包內容（hex格式）
+      Serial.print("Packet: ");
+      for (int i = 0; i < len; i++) {
+        Serial.printf("%02X ", buff[i]);
+      }
+      Serial.println();
       len = 0;
       while (mySerial.available()) mySerial.read();
       return;
@@ -93,6 +105,11 @@ void loop() {
 
     // 如果走到這，代表封包正確
     Serial.println("got data");
+    if (buff[0] != slave_addr) {
+      len = 0;
+      while (mySerial.available()) mySerial.read();
+      return;
+    }
 
     // 處理指令
     if (function_code == 0x11) {
@@ -102,7 +119,9 @@ void loop() {
       uint16_t c = crc16(reply, 2);
       reply[2] = c & 0xFF;
       reply[3] = (c >> 8) & 0xFF;
+    
       mySerial.write(reply, sizeof(reply));
+    
       Serial.print("Reply: ");
       for (int i = 0; i < 4; i++) Serial.printf("%02X ", reply[i]);
       Serial.println();

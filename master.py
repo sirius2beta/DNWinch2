@@ -49,15 +49,15 @@ def expected_length(rx_bytes: bytes) -> int | None:
         return 8
     elif function == 0x11:
         # Report Slave ID: 回傳長度不定
-        if len(rx_bytes) >= 3:
-            byte_count = rx_bytes[2]
-            return 3 + byte_count + 2
+        return 4
+
     # 若功能碼未知，無法判斷
     return None
 
 
+
 # ===== 接收封包 =====
-def read_packet(ser: serial.Serial, timeout=0.5, inter_char_timeout=0.02):
+def read_packet(ser: serial.Serial, timeout=0.5, inter_char_timeout=0.05):
     ser.timeout = 0  # 非阻塞讀取
     buffer = bytearray()
     start_time = time.time()
@@ -111,29 +111,52 @@ def read_packet(ser: serial.Serial, timeout=0.5, inter_char_timeout=0.02):
     print("OK CRC16")
     return buffer
 
+def send_and_read(ser, addr, func, payload=b"", retries=3):
+    for i in range(retries):
+        send_packet(ser, addr, func, payload)
+        resp = read_packet(ser)
+        if resp is not None:
+            return resp
+        print(f"Retry {i+1} failed")
+        time.sleep(0.1)
+    return None
+
 class RS485Master:
     def __init__(self, port: str):
         self.ser = serial.Serial(port=port, baudrate=19200, parity=serial.PARITY_EVEN,
                         stopbits=serial.STOPBITS_ONE, bytesize=serial.EIGHTBITS)
         self.sonar_addr = 0x11
-        self.winch_addr = 0x21
+        self.winch_addr = 0x12
     def close(self):
         self.ser.close()
-    # ===== Wake up =====
-    def wake_up(self):
-        send_packet(self.ser, self.sonar_addr, 0x11)
-        read_packet(self.ser)
+    # ===== 喚醒node1 =====
+    def wake_up_node1(self):
+        send_and_read(self.ser, self.sonar_addr, 0x11)
+        
     # ===== switch control =====
     def setSonar(self, on: bool):
         # data : [0x00, 0x01, 0x00, 0x00](off) / [0x00, 0x01, 0xFF, 0x00](on)
         data = struct.pack(">HH", 0x0001, 0xFF00 if on else 0x0000)
-        send_packet(self.ser, self.sonar_addr, 0x05, data)
-        read_packet(self.ser)
+        send_and_read(self.ser, self.sonar_addr, 0x05, data)
         
     # ===== Winch 控制 =====
+    def wake_up_node2(self):
+        send_and_read(self.ser, self.winch_addr, 0x11)
+
+    def setMaxSpeed(self, speed):
+        send_and_read(self.ser, self.winch_addr, 0x06, struct.pack(">HH", 0x9C40, speed))
+
+    def setAcc(self, acc):
+        send_and_read(self.ser, self.winch_addr, 0x06, struct.pack(">HH", 0x9C41, acc))
+
+    def setCurrentStep(self, step):
+        send_and_read(self.ser, self.winch_addr, 0x10, struct.pack(">HHBi", 0x9C42, 0x0002, 0x04, step))
+
+    def setTargetStep(self, step):
+        send_and_read(self.ser, self.winch_addr, 0x10, struct.pack(">HHBi", 0x9C44, 0x0002, 0x04, step))
+
     def reset_highest(self):
-        send_packet(self.ser, self.winch_addr, 0x21, b"\x00")
-        self.send_cmd(struct.pack(">B", 0x00))
+        send_and_read(self.ser, self.winch_addr, 0x21, b"\x00")
 
     def set_speed_acc(self, maxspeed, acc):
         self.send_cmd(struct.pack(">Bhh", 0x01, maxspeed, acc))
@@ -150,8 +173,8 @@ if __name__ == "__main__":
 
     try:
         while True:
-            # 喚醒超音波模組
-            rs485Master.wake_up()
+            # 喚醒node1
+            rs485Master.wake_up_node1()
             time.sleep(1)
             # 開啟超音波模組
             rs485Master.setSonar(on=True)
@@ -159,6 +182,19 @@ if __name__ == "__main__":
             # 關閉超音波模組
             rs485Master.setSonar(on=False)
             time.sleep(1)
+            # 喚醒node2
+            rs485Master.wake_up_node2()
+            time.sleep(1)
+            # 控制winch
+            rs485Master.setCurrentStep(0)
+            time.sleep(1)
+            rs485Master.setMaxSpeed(1000)
+            time.sleep(1)
+            rs485Master.setAcc(200)
+            time.sleep(1)
+            rs485Master.setTargetStep(0)
+            time.sleep(1)
+
 
     except KeyboardInterrupt:
         print("Exit by user")
