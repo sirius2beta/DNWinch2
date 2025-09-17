@@ -34,8 +34,9 @@ int motorAcc      = 200;
 HX711 scale;
 
 // 狀態
-int32_t currentStep = 0;
+// 狀態
 int32_t currentTension = 0;
+int32_t tensionThreshold = 0;
 bool motorRunning = false;
 
 // -----------------------------
@@ -85,20 +86,64 @@ void processPacket(uint8_t *payload, int len) {
   uint8_t cmd = payload[1];
   if (xSemaphoreTake(node0Mutex, portMAX_DELAY)) {
     switch (cmd) {
-      case 0x11:{
-        uint8_t reply[4];
-        reply[0] = slave_addr;
-        reply[1] = 0x11;
-        uint16_t c = crc16(reply, 2);
-        reply[2] = c & 0xFF;
-        reply[3] = (c >> 8) & 0xFF;
-        MainBus.write(reply, sizeof(reply));
-        Serial.print("Reply: ");
-        for (int i = 0; i < 4; i++) Serial.printf("%02X ", reply[i]);
-        Serial.println();
+
+      case 0x04: { // read input registers
+        if (len < 6) {
+          sendExceptionResponse(0x04, 0x03); // Illegal data value
+          break;
+        }
+      
+        uint16_t startAddr = (payload[2] << 8) | payload[3];
+        uint16_t quantity = (payload[4] << 8) | payload[5];
+      
+        if (quantity == 0 || quantity > 10) {
+          sendExceptionResponse(0x04, 0x03); // Illegal data value
+          break;
+        }
+      
+        Serial.printf("[CMD] Read input registers, addr=%d, qty=%d\n", startAddr, quantity);
+      
+        uint8_t response[256];
+        response[0] = slave_addr;
+        response[1] = 0x04;
+        response[2] = quantity * 2; // data bytes count
+      
+        for (uint16_t i = 0; i < quantity; i++) {
+          uint16_t addr = startAddr + i;
+          uint16_t val = 0;
+      
+          switch (addr) {
+            case 40006:
+              val = (currentTension >> 16) & 0xFFFF; // high 16 bits
+              break;
+            case 40007:
+              val = currentTension & 0xFFFF;         // low 16 bits
+              break;
+            case 40008:
+              val = (stepper.currentPosition() >> 16) & 0xFFFF;
+              break;
+            case 40009:
+              val =  stepper.currentPosition() & 0xFFFF;         // low 16 bits
+              break;
+      
+            default:
+              val = 0xFFFF; // unknown or unsupported register
+              break;
+          }
+      
+          response[3 + i * 2] = (val >> 8) & 0xFF;
+          response[4 + i * 2] = val & 0xFF;
+        }
+      
+        uint16_t crc = crc16(response, 3 + quantity * 2);
+        response[3 + quantity * 2] = crc & 0xFF;
+        response[4 + quantity * 2] = (crc >> 8) & 0xFF;
+      
+        MainBus.write(response, 5 + quantity * 2);
         break;
       }
-      case 0x05:{
+
+      case 0x05:{ // write single coil
         uint16_t coil = (payload[2] << 8) | payload[3];
         uint16_t state = (payload[4] << 8) | payload[5];
         if(coil == 0){
@@ -124,7 +169,7 @@ void processPacket(uint8_t *payload, int len) {
         }
         break;
       }
-      case 0x06:{
+      case 0x06:{ // write single register
         uint16_t addr = (payload[2] << 8) | payload[3];
         uint16_t content = (payload[4] << 8) | payload[5];
         if(addr == 40000){
@@ -168,9 +213,9 @@ void processPacket(uint8_t *payload, int len) {
         Serial.println();
         if(start_addr == 40002){
           if(byte_count == 4){
-            int32_t step = ((int32_t)payload[7] << 24) | ((int32_t)payload[8] << 16) | ((int32_t)payload[9] << 8) | (int32_t)payload[10];
-            stepper.setCurrentPosition(step);
-            Serial.printf("[CMD] Set current step=%1d\n", step);
+            int32_t tension = ((int32_t)payload[7] << 24) | ((int32_t)payload[8] << 16) | ((int32_t)payload[9] << 8) | (int32_t)payload[10];
+            tensionThreshold = tension;
+            Serial.printf("[CMD] Set tension threshold =%1d\n", tension);
           }
         }else if(start_addr == 40004){
           if(byte_count == 4){
@@ -179,7 +224,14 @@ void processPacket(uint8_t *payload, int len) {
             motorRunning = true;
             Serial.printf("[CMD] Move to step=%ld\n", step);
           }
+        }else if(start_addr == 40008){
+          if(byte_count == 4){
+            int32_t step = ((int32_t)payload[7] << 24) | ((int32_t)payload[8] << 16) | ((int32_t)payload[9] << 8) | (int32_t)payload[10];
+            stepper.setCurrentPosition(step);
+            Serial.printf("[CMD] Set current step=%1d\n", step);
+          }
         }
+        
         uint8_t response[8];
         response[0] = slave_addr;
         response[1] = 0x10;
@@ -198,78 +250,6 @@ void processPacket(uint8_t *payload, int len) {
         // 這邊可以寫入你的 register 處理邏輯...
         break;
       }
-      case 0x20: // reset highest point
-        stepper.setCurrentPosition(0);
-        Serial.println("[CMD] Reset highest point");
-        break;
-  
-      case 0x21: // set speed & acc
-        if (len >= 6) {
-          int16_t spd = (int16_t)((payload[2] << 8) | payload[3]);
-          int16_t acc = (int16_t)((payload[4] << 8) | payload[5]);
-          motorMaxSpeed = spd;
-          motorAcc = acc;
-          stepper.setMaxSpeed(motorMaxSpeed);
-          stepper.setAcceleration(motorAcc);
-          Serial.printf("[CMD] Set speed=%d acc=%d\n", spd, acc);
-        }
-        break;
-  
-      case 0x22: // set step
-        if (len >= 6) {
-          int32_t step = ((int32_t)payload[2] << 24) | ((int32_t)payload[3] << 16) | ((int32_t)payload[4] << 8) | (int32_t)payload[5];
-          stepper.moveTo(step);
-          motorRunning = true;
-          Serial.printf("[CMD] Move to step=%ld\n", step);
-        }
-        break;
-  
-      case 0x023: // stop
-        stepper.setCurrentPosition(stepper.currentPosition());
-        motorRunning = false;
-        Serial.println("[CMD] Stop");
-        break;
-  
-      case 0x24: { // get status
-        uint8_t resp[1 + 1 + 4 + 4 + 1]; // addr + cmd + step + tension + running
-        resp[0] = slave_addr;
-        resp[1] = 0x04;
-        int32_t step = stepper.currentPosition();
-        resp[2] = (step >> 24) & 0xFF;
-        resp[3] = (step >> 16) & 0xFF;
-        resp[4] = (step >> 8) & 0xFF;
-        resp[5] = step & 0xFF;
-        resp[6] = (currentTension >> 24) & 0xFF;
-        resp[7] = (currentTension >> 16) & 0xFF;
-        resp[8] = (currentTension >> 8) & 0xFF;
-        resp[9] = currentTension & 0xFF;
-        resp[10] = motorRunning ? 1 : 0;
-  
-        // 封包回傳
-        sendPacket(resp, sizeof(resp));
-        Serial.println("Reply 0x04 sent");
-        break;
-      }
-  
-      case 0x25: // set tension threshold
-        if (len >= 6) {
-          int32_t tension = ((int32_t)payload[2] << 24) | ((int32_t)payload[3] << 16) | ((int32_t)payload[4] << 8) | (int32_t)payload[5];
-          Serial.printf("[CMD] Set tension threshold=%ld\n", tension);
-        }
-        break;
-  
-      case 0x26: // reset pos = 0
-        stepper.setCurrentPosition(0);
-        Serial.println("[CMD] Reset pos=0");
-        break;
-  
-      case 0x27: // get aqua cached data
-        Serial.println("[CMD] Get Aqua data");
-        //replyAquaSnapshotToNode0();
-        Serial.println("Node0: CMD 0x07 sent aqua snapshot");
-        break;
-  
-        
   
       default:
         Serial.printf("[CMD] Unknown cmd=%02X\n", cmd);
@@ -331,8 +311,8 @@ void handleUART() {
     uint8_t function_code = buff2[1];
     int expected_len = 0;
 
-    if (function_code == 0x11) {
-      expected_len = 4;
+    if (function_code == 0x04) {
+      expected_len = 8;
     } else if (function_code == 0x05) {
       expected_len = 8;
     } else if (function_code == 0x06) {
