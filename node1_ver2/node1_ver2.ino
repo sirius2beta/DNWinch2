@@ -16,9 +16,6 @@
 #define DIR_PIN  12
 AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
 
-int motorMaxSpeed = 1000;
-int motorAcc      = 200;
-
 // 秤重感測器
 #define HX711_DT  26
 #define HX711_SCK 27
@@ -73,7 +70,7 @@ uint16_t cbSetCurPos(TRegister* reg, uint16_t val) {
 // Coil 控制 馬達緊急煞車
 uint16_t cbMotorRun(TRegister* reg, uint16_t val) {
   if(!COIL_BOOL(val)){
-    stepper.stop();
+    stepper.setCurrentPosition(stepper.currentPosition());
     Serial.println("[CMD] Motor STOP");
     motorRunning = false;
   }
@@ -96,13 +93,13 @@ uint16_t cbSetTargetPos(TRegister* reg, uint16_t val) {
 
 uint16_t cbSetSpeed(TRegister* reg, uint16_t val) {
   stepper.setMaxSpeed(val);
-  Serial.printf("[CMD] Set speed=%d\n", motorMaxSpeed);
+  Serial.printf("[CMD] Set speed=%d\n", val);
   return val;
 }
 
 uint16_t cbSetAcc(TRegister* reg, uint16_t val) {
   stepper.setAcceleration(val);
-  Serial.printf("[CMD] Set acc=%d\n", motorAcc);
+  Serial.printf("[CMD] Set acc=%d\n", val);
   return val;
 }
 
@@ -114,6 +111,14 @@ uint16_t cbSetThr(TRegister* reg, uint16_t val) {
   return val;
 }
 
+// Node0 task
+void node0Task(void *pv) {
+  (void)pv;
+  for (;;) {
+    mb.task();
+  }
+}
+
 void setup() {
   Serial.begin(115200);
 
@@ -123,8 +128,8 @@ void setup() {
   mb.slave(SLAVE_ID);
 
   // 配置暫存器
-  mb.addHreg(HR_SPEED, motorMaxSpeed);
-  mb.addHreg(HR_ACC, motorAcc);
+  mb.addHreg(HR_SPEED, 2000);
+  mb.addHreg(HR_ACC, 1000);
   mb.addHreg(HR_THR_H, 0);
   mb.addHreg(HR_THR_L, 0);
   mb.addHreg(HR_MOV_H, 0);
@@ -150,24 +155,25 @@ void setup() {
 
 
   // 馬達初始化
-  stepper.setMaxSpeed(motorMaxSpeed);
-  stepper.setAcceleration(motorAcc);
+  stepper.setMaxSpeed(2000);
+  stepper.setAcceleration(1000);
 
   // HX711
   scale.begin(HX711_DT, HX711_SCK);
   Serial.println("HX711 ready");
+  xTaskCreatePinnedToCore(node0Task, "node0Task", 4096, NULL, 1, NULL, 1);
 }
 
 void loop() {
-  mb.task();
+  
 
   // 更新感測數據
   if (scale.is_ready()) {
-    currentTension = (int32_t)scale.get_units();
+    currentTension = (int32_t)scale.read();
   }
   //如果 tension<tension threshold，不可下降
   if(stepper.distanceToGo()>0 && currentTension<tensionThreshold){
-    stepper.stop();
+    stepper.setCurrentPosition(stepper.currentPosition());
     motorRunning = false;
     Serial.println("[SAFETY] Tension below threshold, Motor STOP");
   }
