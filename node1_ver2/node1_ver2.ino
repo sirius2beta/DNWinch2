@@ -29,7 +29,7 @@ int32_t tensionThreshold = 0;
 bool motorRunning = false;
 
 // Modbus
-HardwareSerial RS485(2);
+HardwareSerial MainBus(2);
 ModbusRTU mb;
 
 // 暫存器定義
@@ -50,6 +50,7 @@ enum {
   IR_TEN_L,           // 30007: currentTension 低16位
   IR_POS_H,           // 30008: currentPosition 高16位
   IR_POS_L,           // 30009: currentPosition 低16位
+  IR_RUN_STATE,      // 30010: Motor Run State (0xFF=running, 0x00=stopped)
   IR_COUNT
 };
 
@@ -58,25 +59,8 @@ enum {
   COIL_COUNT
 };
 
-// callback：當 master 寫入 HR_CURPOS_H 或 HR_CURPOS_L 時觸發
-bool cbSetCurPosx(TRegister* reg, uint16_t val) {
-  // 讀取高低位
-  if(reg->address.address == HR_CURPOS_H){
-  }else{
-    uint16_t high = mb.Hreg(HR_CURPOS_H);
-    uint16_t low  = val;
-    int32_t newPos = ((int32_t)high << 16) | low;
-    stepper.setCurrentPosition(newPos);
-    Serial.printf("[DEBUG] HR_CURPOS_H=%04X, HR_CURPOS_L=%04X\n", high, low);
-    Serial.printf("[CMD] Master set CurrentStep = %ld\n", newPos);
-  }
-
-
-  return val;
-}
-
+// callback functions
 uint16_t cbSetCurPos(TRegister* reg, uint16_t val) {
-
   uint16_t high = mb.Hreg(HR_CURPOS_H);
   uint16_t low  = val;
   int32_t newPos = ((int32_t)high << 16) | low;
@@ -86,19 +70,19 @@ uint16_t cbSetCurPos(TRegister* reg, uint16_t val) {
   return val;
 }
 
-// Coil 控制馬達運轉
+// Coil 控制 馬達緊急煞車
 uint16_t cbMotorRun(TRegister* reg, uint16_t val) {
-  if(COIL_BOOL(val)){
+  if(!COIL_BOOL(val)){
     stepper.stop();
     Serial.println("[CMD] Motor STOP");
     motorRunning = false;
   }
   return val;
+
 }
 
 
 uint16_t cbSetTargetPos(TRegister* reg, uint16_t val) {
-
   uint16_t high = mb.Hreg(HR_MOV_H);
   uint16_t low  = val;
   int32_t newStep = ((int32_t)high << 16) | low;
@@ -108,12 +92,34 @@ uint16_t cbSetTargetPos(TRegister* reg, uint16_t val) {
   return val;
 }
 
+
+
+uint16_t cbSetSpeed(TRegister* reg, uint16_t val) {
+  stepper.setMaxSpeed(val);
+  Serial.printf("[CMD] Set speed=%d\n", motorMaxSpeed);
+  return val;
+}
+
+uint16_t cbSetAcc(TRegister* reg, uint16_t val) {
+  stepper.setAcceleration(val);
+  Serial.printf("[CMD] Set acc=%d\n", motorAcc);
+  return val;
+}
+
+uint16_t cbSetThr(TRegister* reg, uint16_t val) {
+  uint16_t high = mb.Hreg(HR_THR_H);
+  uint16_t low  = val;
+  tensionThreshold = ((int32_t)high << 16) | low;
+  Serial.printf("[CMD] Set tensionThreshold=%d\n", tensionThreshold);
+  return val;
+}
+
 void setup() {
   Serial.begin(115200);
 
   // 初始化 RS485
-  RS485.begin(19200, SERIAL_8E1, UART2_RX, UART2_TX);
-  mb.begin(&RS485, DE_RE);
+  MainBus.begin(19200, SERIAL_8E1, UART2_RX, UART2_TX);
+  mb.begin(&MainBus, DE_RE);
   mb.slave(SLAVE_ID);
 
   // 配置暫存器
@@ -130,13 +136,17 @@ void setup() {
   mb.addIreg(IR_TEN_L, 0);
   mb.addIreg(IR_POS_H, 0);
   mb.addIreg(IR_POS_L, 0);
-
+  mb.addIreg(IR_RUN_STATE, 0);
   mb.addCoil(COIL_RUN, true);
 
   // 當 master 寫 Hreg 的值時，觸發 cbSetCurPos
   mb.onSetHreg(HR_CURPOS_L, cbSetCurPos);
   mb.onSetHreg(HR_MOV_L, cbSetTargetPos);
   mb.onSetCoil(COIL_RUN, cbMotorRun);
+  mb.onSetHreg(HR_SPEED, cbSetSpeed);
+  mb.onSetHreg(HR_ACC, cbSetAcc);
+  mb.onSetHreg(HR_THR_L, cbSetThr);
+
 
 
   // 馬達初始化
@@ -155,39 +165,19 @@ void loop() {
   if (scale.is_ready()) {
     currentTension = (int32_t)scale.get_units();
   }
-
+  //如果 tension<tension threshold，不可下降
+  if(stepper.distanceToGo()>0 && currentTension<tensionThreshold){
+    stepper.stop();
+    motorRunning = false;
+    Serial.println("[SAFETY] Tension below threshold, Motor STOP");
+  }
   // 更新 Input Register
   mb.Ireg(IR_TEN_H, (currentTension >> 16) & 0xFFFF);
   mb.Ireg(IR_TEN_L, currentTension & 0xFFFF);
   mb.Ireg(IR_POS_H, (stepper.currentPosition() >> 16) & 0xFFFF);
   mb.Ireg(IR_POS_L, stepper.currentPosition() & 0xFFFF);
-
-  // Holding Register → 馬達參數
-  int newSpeed = mb.Hreg(HR_SPEED);
-  if (newSpeed != motorMaxSpeed) {
-    motorMaxSpeed = newSpeed;
-    stepper.setMaxSpeed(motorMaxSpeed);
-    Serial.printf("[CMD] Set speed=%d\n", motorMaxSpeed);
-  }
-
-  int newAcc = mb.Hreg(HR_ACC);
-  if (newAcc != motorAcc) {
-    motorAcc = newAcc;
-    stepper.setAcceleration(motorAcc);
-    Serial.printf("[CMD] Set acc=%d\n", motorAcc);
-  }
-
-  // Tension threshold
-  int32_t newThr = ((int32_t)mb.Hreg(HR_THR_H) << 16) | mb.Hreg(HR_THR_L);
-  if (newThr != tensionThreshold) {
-    tensionThreshold = newThr;
-    Serial.printf("[CMD] Set tension threshold=%ld\n", tensionThreshold);
-  }
-
-
+  mb.Ireg(IR_RUN_STATE, stepper.isRunning() ? 0xFF : 0x00);
   
-
-
-    stepper.run();
+  stepper.run();
 
 }

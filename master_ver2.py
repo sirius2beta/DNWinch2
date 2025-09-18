@@ -50,6 +50,15 @@ class RS485MasterPymodbus:
             print(f"[Node2] Set Acc = {acc}")
         except ModbusException as e:
             print(f"[Node2] Set Acc failed: {e}")
+    def setTensionThreshold(self, tension):
+        try:
+            high = (tension >> 16) & 0xFFFF
+            low = tension & 0xFFFF
+            # ESP 定義在 Hreg[2] 和 Hreg[3] → 40003 和 40004
+            self.client.write_registers(2, [high, low], slave=self.winch_addr)
+            print(f"[Node2] Set Tension Threshold = {tension}")
+        except ModbusException as e:
+            print(f"[Node2] Set Tension Threshold failed: {e}")
 
     def getCurrentStep(self):
         try:
@@ -62,6 +71,8 @@ class RS485MasterPymodbus:
             else:
                 high, low = result.registers
                 step = (high << 16) | low
+                if step & 0x80000000:  # 補 signed
+                    step -= 0x100000000
                 print(f"[Node2] Current Step = {step}")
                 return step
         except ModbusException as e:
@@ -90,7 +101,7 @@ class RS485MasterPymodbus:
     def getStatus(self):
         # read 30006~30009 (currentTension(32bit), currentStep(32bit))
         try:
-            result = self.client.read_input_registers(6, count=4, slave=self.winch_addr)
+            result = self.client.read_input_registers(6, count=5, slave=self.winch_addr)
             if result.isError():
                 print("[Node2] Get Status failed")
                 return None
@@ -98,7 +109,13 @@ class RS485MasterPymodbus:
                 regs = result.registers
                 tension = (regs[0] << 16) | regs[1]
                 step = (regs[2] << 16) | regs[3]
-                print(f"[Node2] Status - Tension: {tension}, Step: {step}")
+                if step & 0x80000000:  # 補 signed
+                    step -= 0x100000000
+                    runningState = regs[4]
+                print(f"[Node2] Status - Tension: {tension}, Step: {step}, RunningState: {'Running' if runningState==0xFF else 'Stopped'}")
+                tension = (regs[0] << 16) | regs[1]
+                step    = (regs[2] << 16) | regs[3]
+                
                 return tension, step
         except ModbusException as e:
             print(f"[Node2] Get Status failed: {e}")
@@ -114,11 +131,15 @@ if __name__ == "__main__":
         time.sleep(1)
         master.setAcc(100)
         time.sleep(1)
+        master.setTensionThreshold(1500)
+        time.sleep(1)
         master.getCurrentStep()
         time.sleep(1)
-        master.setCurrentStep(120)
+        master.setCurrentStep(0)
         time.sleep(1)
-        master.setTargetStep(1000000)
+        master.setTargetStep(-10000)
+        time.sleep(1)
+        #master.startMotor(False)
         time.sleep(1)
         while True:
             master.getStatus()
