@@ -1,5 +1,6 @@
 #define MODBUSRTU_TIMEOUT 6000
 #include <ModbusRTU.h>
+#define MODBUSRTU_TIMEOUT 6000  // 必須放在 include 前面
 
 // =========== Aqua部分=========
 #define AQUA_ID 1                
@@ -50,7 +51,7 @@ bool waitingResponse = false;
 // ------------------- Callback -------------------
 bool cbRead(Modbus::ResultCode event, uint16_t transactionId, void* data) {
   // 不管 228，只要有資料就存
-  if (event == Modbus::EX_SUCCESS || Modbus::EX_TIMEOUT) {
+  if (event == Modbus::EX_SUCCESS) {
     waitingResponse = false;
     uint32_t tmp = ((uint32_t)sensorBuf[currentSensor][0] << 16) | sensorBuf[currentSensor][1];
     float value = 0;
@@ -64,7 +65,19 @@ bool cbRead(Modbus::ResultCode event, uint16_t transactionId, void* data) {
     Serial.printf("value: %f\n", value);
     currentSensor = (currentSensor + 1) % AQUA_SENSOR_COUNT;
   }else{
-    Serial.printf("error code: %X \n", event);
+    Serial.printf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!error code: %X \n", event);
+    waitingResponse = false;
+    uint32_t tmp = ((uint32_t)sensorBuf[currentSensor][0] << 16) | sensorBuf[currentSensor][1];
+    float value = 0;
+    memcpy(&value, &tmp, sizeof(float));
+    Serial.printf("sensor index: %d\n", currentSensor);
+    Serial.printf("raw:");
+    for(int i=0;i<REG_COUNT;i++){
+        Serial.printf(" %X ", sensorBuf[currentSensor][i]);
+    }
+    Serial.println();
+    Serial.printf("value: %f\n", value);
+    currentSensor = (currentSensor + 1) % AQUA_SENSOR_COUNT;
   }
 
   return true; // 告訴 Modbus 回應已處理

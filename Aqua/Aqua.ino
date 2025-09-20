@@ -1,16 +1,23 @@
 #include <HardwareSerial.h>
 
-#define SerialAqua Serial2
+//UART
+#define UART1_TX 23
+#define UART1_RX 22
+HardwareSerial AquaBus(1);
 
+#define AQUA_TIMEOUT 6000
+#define AQUA_SENSOR_COUNT 21     
 
 const uint8_t aquaWakeupCmd[4] = {0x01, 0x11, 0xC0, 0x2C};
 const uint8_t specialRegisterCmd[8] = {0x01, 0x03, 0x25, 0x23, 0x00, 0x01, 0x7E, 0xCC};
 uint8_t aquaSpecialCmd[11] = {0x01, 0x10, 0x25, 0x24, 0x00, 0x01, 0x02, 0x07, 0xD0, 0xD7, 0xDA};
 
-bool waked = false;
+bool aqua_waked = false;
+
+volatile int currentSensor = 0;
 
 // Aqua 各感測器寄存器讀取指令
-const uint8_t aquaCmds[][8] = {
+const uint8_t aquaCmds[AQUA_SENSOR_COUNT][8] = {
     {0x01,0x03,0x15,0x4A,0x00,0x07,0x21,0xD2}, // 0 溫度
     {0x01,0x03,0x15,0x51,0x00,0x07,0x51,0xD5}, // 1 壓力
     {0x01,0x03,0x15,0x58,0x00,0x07,0x81,0xD7}, // 2 深度
@@ -33,7 +40,9 @@ const uint8_t aquaCmds[][8] = {
     {0x01,0x03,0x16,0x23,0x00,0x07,0xF1,0x8A}, // 19 外部電壓
     {0x01,0x03,0x16,0x2A,0x00,0x07,0x21,0x88}  // 20 電池容量
 };
-const size_t aquaCmdCount = sizeof(aquaCmds) / sizeof(aquaCmds[0]);
+
+uint8_t AquaIregOffset = 20;
+float AquaInputBuff[AQUA_SENSOR_COUNT];
 
 uint16_t crc16(const uint8_t *data, uint16_t len) {
     uint16_t crc = 0xFFFF;
@@ -57,17 +66,17 @@ void wakeupAqua() {
 
   // Step 1: Keep sending wakeup command until any response is received
   while (true) {
-    SerialAqua.write(aquaWakeupCmd, sizeof(aquaWakeupCmd));
+    AquaBus.write(aquaWakeupCmd, sizeof(aquaWakeupCmd));
 
     start = millis();
     bool gotResponse = false;
 
     // Wait up to 1000ms for any response
     while (millis() - start < 1000) {
-      if (SerialAqua.available() > 0) {
-        while (SerialAqua.available()){
+      if (AquaBus.available() > 0) {
+        while (AquaBus.available()){
           if (rlen < sizeof(buffer)) {
-            buffer[rlen++] = SerialAqua.read();
+            buffer[rlen++] = AquaBus.read();
           }
         }
         gotResponse = true;
@@ -79,10 +88,10 @@ void wakeupAqua() {
       Serial.println("✅ Aqua responded. Proceeding to special command...");
       delay(200); // Optional delay between retries to avoid spamming
       // 跳過 special code!!!
-      while (SerialAqua.available()) {
-        SerialAqua.read(); // 丟掉上一次的資料
+      while (AquaBus.available()) {
+        AquaBus.read(); // 丟掉上一次的資料
       }
-      waked = true;
+      aqua_waked = true;
       return;
     }
   }
@@ -105,62 +114,79 @@ float bytesToFloat(uint8_t* bytes) {
 }
 
 bool readAquaRegister(size_t index, float &value) {
-  if (index >= aquaCmdCount) return false;
+  if (index >= AQUA_SENSOR_COUNT) return false;
 
   const uint8_t *cmd = aquaCmds[index];
-  SerialAqua.write(cmd, 8);
+  AquaBus.write(cmd, 8);
   unsigned long start = millis();
   uint8_t resp[19];
   int rlen = 0;
 
-  while (millis() - start < 3000) {
-    if (SerialAqua.available()) {
-      resp[rlen++] = SerialAqua.read();
+  while (millis() - start < AQUA_TIMEOUT) {
+    if (AquaBus.available()) {
+      resp[rlen++] = AquaBus.read();
       if (rlen == 19) break;
     }
   }
   if (rlen != 19) {
-    Serial.println("⚠️ Aqua timeout / response error");
+    Serial.println("[AquaTask] Aqua timeout / response error");
     return false;
   }
-
   value = bytesToFloat(&resp[3]);
+  AquaInputBuff[currentSensor] = value;
   return true;
 }
 
+// ------------------- Task -------------------
+void aquaTask(void *pv) {
+  for (;;) {
+    Serial.println("[AquaTask] Sending wakeup command repeatedly...");
+    if(!aqua_waked){
+      wakeupAqua();
+    }
+    unsigned long start = millis();
+    for (;;) {
+      float value = 0.0;
+      if (readAquaRegister(currentSensor, value)) {
+        Serial.print("[AquaTask] Sensor Index ");
+        Serial.print(currentSensor);
+        Serial.print(" → Value: ");
+        Serial.println(value, 4); // 4 decimal places
+      } else {
+        Serial.print("[AquaTask] Sensor Index ");
+        Serial.print(currentSensor);
+        Serial.println(" → ❌ Failed to read");
+      }
+      currentSensor = (currentSensor + 1) % AQUA_SENSOR_COUNT;
+      //delay(100); // wait before next sensor read
+      if(currentSensor == 0){
+        unsigned long operation_time = millis()-start;
+        start = millis();
+        Serial.print("[AquaTask] Loop operation time: ");
+        Serial.print(operation_time);
+        Serial.println(" ms");
+        // print aqua input buffer raw data in hex
+        Serial.println("Aqua Input Buffer (Hex):");
+        for(int i=0;i<AQUA_SENSOR_COUNT;i++){
+          Serial.printf("%f ", AquaInputBuff[i]);
+          if((i+1)%8==0) Serial.println();
+        }
+      }
+    }
+    
+  }
+}
+
+
 void setup() {
   Serial.begin(115200);
-  SerialAqua.begin(19200, SERIAL_8E1,16, 17); // RX = GPIO7, TX = GPIO6 (or D4/D5 if mapped that way)
-
+  AquaBus.begin(19200, SERIAL_8E1, UART1_RX, UART1_TX);
 
   while (!Serial);
-  Serial.println("🔧 Setup done");
+  xTaskCreatePinnedToCore(aquaTask, "aquaTask", 4096, NULL, 1, NULL, 1);
+  Serial.println("Aqua Setup done");
 }
 
 void loop() {
-  Serial.println("🔄 Sending wakeup command repeatedly...");
-  if(! waked){
-    wakeupAqua();
-  }
   
-  unsigned long start = millis();
-  for (size_t i = 0; i < aquaCmdCount; ++i) {
-    float value = 0.0;
-    if (readAquaRegister(i, value)) {
-      Serial.print("Sensor Index ");
-      Serial.print(i);
-      Serial.print(" → Value: ");
-      Serial.println(value, 4); // 4 decimal places
-    } else {
-      Serial.print("Sensor Index ");
-      Serial.print(i);
-      Serial.println(" → ❌ Failed to read");
-    }
-    //delay(100); // wait before next sensor read
-  }
-  unsigned long operation_time = millis()-start;
-
-  Serial.print("⌛ Loop operation time: ");
-  Serial.print(operation_time);
-  Serial.println(" ms");
 }

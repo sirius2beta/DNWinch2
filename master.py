@@ -175,6 +175,9 @@ class RS485Master:
 
     def setAcc(self, acc):
         self.send_and_read(self.winch_addr, 0x06, struct.pack(">HH", 40001, acc))
+
+    def setTensionThreshold(self, tension):
+        self.send_and_read(self.winch_addr, 0x10, struct.pack(">HHBi", 40002, 0x0002, 0x04, tension))
     
     def getCurrentStep(self, step):
         self.send_and_read(self.winch_addr, 0x04, struct.pack(">HH", 40008, 0x0002))
@@ -193,7 +196,24 @@ class RS485Master:
 
     def set_step(self, step):
         self.send_cmd(struct.pack(">Bi", 0x02, step))
-
+    def get_aqua_data(self): # 待建置
+        # read input registers from 20, all 21 sensors, convert to 32-bit float
+        aqua_data = []
+        try:
+            result = self.client.read_input_registers(20, count=21*2, slave=self.winch_addr)
+            if result.isError():
+                print("[Node2] Get Aqua Data failed")
+                return None
+            else:
+                regs = result.registers
+                for i in range(0, len(regs), 2):
+                    val = struct.unpack('>f', struct.pack('>HH', regs[i], regs[i+1]))[0]
+                    aqua_data.append(val)
+                print(f"[Node2] Aqua Data: {aqua_data}")
+                return aqua_data
+        except ModbusException as e:
+            print(f"[Node2] Get Aqua Data failed: {e}")
+            return None
     def stop(self):
         self.send_cmd(struct.pack(">B", 0x03))
 
@@ -226,6 +246,7 @@ if __name__ == "__main__":
             time.sleep(3)
             rs485Master.setTargetStep(0)
             time.sleep(3)
+            rs485Master.get_aqua_data();
 
 
     except KeyboardInterrupt:
