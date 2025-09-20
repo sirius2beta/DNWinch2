@@ -5,8 +5,11 @@
 
 // Slave address
 #define SLAVE_ID 0x12
+#define AQUA_ID  0x01
 
 // UART2 for RS485
+#define UART1_TX 35
+#define UART1_RX 34
 #define UART2_TX 17
 #define UART2_RX 16
 #define DE_RE    4   // RS485 driver DE/RE control pin (自己選一個 IO 腳位)
@@ -26,8 +29,10 @@ int32_t tensionThreshold = 0;
 bool motorRunning = false;
 
 // Modbus
+HardwareSerial AquaBus(1);
 HardwareSerial MainBus(2);
 ModbusRTU mb;
+ModbusRTU mbAqua;
 
 // 暫存器定義
 enum {
@@ -39,6 +44,10 @@ enum {
   HR_MOV_L,           // 40005: moveTo step 低16位
   HR_CURPOS_H,        // 40006: set current pos 高16位
   HR_CURPOS_L,        // 40007: set current pos 低16位
+  HR_AQ_TEMP_H = 8, // 40008: Aqua 溫度 高16位
+  HR_AQ_TEMP_L,     // 40009: Aqua 溫度 低16位
+  HR_AQ_PRES_H,     // 40010: Aqua 壓力 高16位
+  HR_AQ_PRES_L,     // 40011: Aqua 壓力 低16位
   HR_COUNT
 };
 
@@ -89,8 +98,6 @@ uint16_t cbSetTargetPos(TRegister* reg, uint16_t val) {
   return val;
 }
 
-
-
 uint16_t cbSetSpeed(TRegister* reg, uint16_t val) {
   stepper.setMaxSpeed(val);
   Serial.printf("[CMD] Set speed=%d\n", val);
@@ -119,13 +126,84 @@ void node0Task(void *pv) {
   }
 }
 
+const int AQUA_SENSOR_COUNT  = 5;
+uint16_t aquaSensorAddr[] = {
+  5450, 5457, 5464, 5471, 5478
+};
+// 每個 sensor 讀取的暫存器數量
+const uint16_t REG_COUNT  = 7;
+
+// 儲存每個 sensor 的回傳值
+uint16_t sensorBuf[AQUA_SENSOR_COUNT ][REG_COUNT];
+
+// 當前正在輪詢的 index
+int currentSensor = 0;
+
+
+// callback function
+bool cbRead(Modbus::ResultCode event, uint16_t transactionId, void* data) {
+  if (event == Modbus::EX_SUCCESS) {
+    uint16_t* buf = (uint16_t*) data;
+    memcpy(sensorBuf[currentSensor], buf, REG_COUNT * sizeof(uint16_t));
+
+    Serial.printf("[Sensor Addr %u] ",
+                  aquaSensorAddr[currentSensor]);
+    for (int i = 0; i < REG_COUNT; i++) {
+      Serial.printf("%u ", buf[i]);
+    }
+    Serial.println();
+  } else {
+    Serial.printf("[Sensor Addr %u] read failed, code=%d\n",
+                  aquaSensorAddr[currentSensor], event);
+  }
+
+  // 換下一個 sensor
+  currentSensor = (currentSensor + 1) % AQUA_SENSOR_COUNT;
+
+  // 立刻送出下一個請求
+  uint16_t tid = mbAqua.readHreg(
+                    AQUA_ID,
+                    aquaSensorAddr[currentSensor],
+                    sensorBuf[currentSensor],
+                    REG_COUNT,
+                    cbRead
+                 );
+  if (tid == 0) {
+    Serial.println("Failed to start next request");
+  }
+
+  return true;
+}
+
+void aquaTask(void *pv) {
+  // 先啟動第一個 request
+  mbAqua.readHreg(AQUA_ID,
+                  aquaSensorAddr[currentSensor],
+                  sensorBuf[currentSensor],
+                  REG_COUNT,
+                  cbRead);
+
+  for (;;) {
+    mbAqua.task();   // 驅動 Modbus 狀態機
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+
+
+
 void setup() {
   Serial.begin(115200);
 
-  // 初始化 RS485
+  // 初始化 Mainbus
   MainBus.begin(19200, SERIAL_8E1, UART2_RX, UART2_TX);
   mb.begin(&MainBus, DE_RE);
   mb.slave(SLAVE_ID);
+
+  // 初始化 AquaBus
+  AquaBus.begin(19200, SERIAL_8E1, UART1_RX, UART1_TX);
+  AquaBus.setTimeout(3000);
+  mbAqua.begin(&AquaBus);
+  mbAqua.master();
 
   // 配置暫存器
   mb.addHreg(HR_SPEED, 2000);
@@ -162,6 +240,7 @@ void setup() {
   scale.begin(HX711_DT, HX711_SCK);
   Serial.println("HX711 ready");
   xTaskCreatePinnedToCore(node0Task, "node0Task", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(aquaTask, "aquaTask", 4096, NULL, 1, NULL, 1);
 }
 
 void loop() {
