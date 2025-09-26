@@ -14,58 +14,58 @@ class RS485MasterPymodbus:
             timeout=1
         )
         self.client.connect()
-        self.sonar_addr = 0x11
-        self.winch_addr = 0x12
+        self.node1_addr = 0x11
+        self.node2_addr = 0x12
 
     def close(self):
         self.client.close()
+    
+    # ---------- Node 1 (Sonar) ----------
 
-    def setSonar(self, on: bool):
+    def setSonarPWR(self, on: bool):
         try:
-            coil_addr = 0  # Coil 位址是從 0 起算
-            self.client.write_coil(coil_addr, on, slave=self.sonar_addr)
+            coil_addr = 0  
+            self.client.write_coil(coil_addr, on, slave=self.node1_addr)
             print(f"[Node1] Set sonar {'ON' if on else 'OFF'}")
         except ModbusException as e:
             print(f"[Node1] Set sonar failed: {e}")
-    def startMotor(self, on: bool):
+
+    # ---------- Node 2 (Motor Controller) ----------
+
+    def stopMotor(self):
         try:
-            coil_addr = 0  # Coil 位址是從 0 起算
-            self.client.write_coil(coil_addr, on, slave=self.winch_addr)
-            print(f"[Node2] Set motor {'ON' if on else 'OFF'}")
+            coil_addr = 0  
+            self.client.write_coil(coil_addr, False, slave=self.node2_addr)
+            print(f"[Node2] stop motor")
         except ModbusException as e:
             print(f"[Node2] Set motor failed: {e}")
 
     def setMaxSpeed(self, speed):
         try:
-            # ESP 定義在 Hreg[0] → 40001
-            self.client.write_register(0, speed, slave=self.winch_addr)
+            self.client.write_register(0, speed, slave=self.node2_addr)
             print(f"[Node2] Set MaxSpeed = {speed}")
         except ModbusException as e:
             print(f"[Node2] Set MaxSpeed failed: {e}")
 
     def setAcc(self, acc):
         try:
-            # ESP 定義在 Hreg[1] → 40002
-            self.client.write_register(1, acc, slave=self.winch_addr)
+            self.client.write_register(1, acc, slave=self.node2_addr)
             print(f"[Node2] Set Acc = {acc}")
         except ModbusException as e:
             print(f"[Node2] Set Acc failed: {e}")
+
     def setTensionThreshold(self, tension):
         try:
             high = (tension >> 16) & 0xFFFF
             low = tension & 0xFFFF
-            # ESP 定義在 Hreg[2] 和 Hreg[3] → 40003 和 40004
-            self.client.write_registers(2, [high, low], slave=self.winch_addr)
+            self.client.write_registers(2, [high, low], slave=self.node2_addr)
             print(f"[Node2] Set Tension Threshold = {tension}")
         except ModbusException as e:
             print(f"[Node2] Set Tension Threshold failed: {e}")
 
     def getCurrentStep(self):
         try:
-            # ESP32 端 IR_POS_H = 6 → 對應到 30007
-            # pymodbus 呼叫時直接用 6
-            result = self.client.read_input_registers(8, count=2, slave=self.winch_addr)
-
+            result = self.client.read_input_registers(8, count=2, slave=self.node2_addr)
             if result.isError():
                 print("[Node2] Get Current Step failed")
             else:
@@ -83,8 +83,7 @@ class RS485MasterPymodbus:
         try:
             high = (step >> 16) & 0xFFFF
             low = step & 0xFFFF
-            # ESP 定義在 Hreg[8] → 40009
-            self.client.write_registers(6, [high, low], slave=self.winch_addr)
+            self.client.write_registers(6, [high, low], slave=self.node2_addr)
             print(f"[Node2] Set Current Step = {step}")
         except ModbusException as e:
             print(f"[Node2] Set Current Step failed: {e}")
@@ -94,15 +93,16 @@ class RS485MasterPymodbus:
             high = (step >> 16) & 0xFFFF
             low = step & 0xFFFF
             # ESP 定義在 Hreg[4] → 40005
-            self.client.write_registers(4, [high, low], slave=self.winch_addr)
+            self.client.write_registers(4, [high, low], slave=self.node2_addr)
             print(f"[Node2] Set Target Step = {step}")
         except ModbusException as e:
             print(f"[Node2] Set Target Step failed: {e}")
+
     def getStatus(self):
-        # read 30006~30009 (currentTension(32bit), currentStep(32bit))
+        # read 30006~30010 (currentTension(32bit), currentStep(32bit), isRunning(16bit))
         runningState = 0x00
         try:
-            result = self.client.read_input_registers(6, count=5, slave=self.winch_addr)
+            result = self.client.read_input_registers(6, count=5, slave=self.node2_addr)
             if result.isError():
                 print("[Node2] Get Status failed")
                 return None
@@ -122,10 +122,10 @@ class RS485MasterPymodbus:
             print(f"[Node2] Get Status failed: {e}")
             return None
         
-    def get_aqua_data(self): # 待建置
+    def get_aqua_data(self):
         # read input registers from 20, all 21 sensors, convert to 32-bit float
         try:
-            result = self.client.read_input_registers(20, count=42, slave=self.winch_addr)
+            result = self.client.read_input_registers(20, count=42, slave=self.node2_addr)
             if result.isError():
                 print("[Node2] Get Aqua Data failed")
                 return None
@@ -144,9 +144,8 @@ class RS485MasterPymodbus:
             print(f"[Node2] Get Aqua Data failed: {e}")
             return None
 
-    def basic_manuver(self):
-        self.startMotor(True)
-        time.sleep(0.5)
+    def testMotorManuver(self):
+
         self.setMaxSpeed(2000)
         time.sleep(0.5)
         self.setAcc(500)
@@ -164,7 +163,7 @@ class RS485MasterPymodbus:
             if count ==9:
                 count = 0
                 target = -target
-                self.startMotor(False)
+                self.stopMotor()
                 time.sleep(0.5)
             self.setTargetStep(target)
             self.getStatus()
@@ -173,14 +172,19 @@ class RS485MasterPymodbus:
             time.sleep(1)
     def testSonar(self):
         while True:
-            self.setSonar(True)
+            self.setSonarPWR(True)
             time.sleep(5)
-            self.setSonar(False)
+            self.setSonarPWR(False)
             time.sleep(5)
+    def testStatus(self):
+        while True:
+            self.getStatus()
+            time.sleep(2)
+
 if __name__ == "__main__":
     master = RS485MasterPymodbus(port="COM13")
     try:
-        master.testSonar()
+        master.testStatus()
     
     except KeyboardInterrupt:
         print("Interrupted by user")
