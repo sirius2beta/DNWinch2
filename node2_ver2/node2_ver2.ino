@@ -19,6 +19,7 @@
 
 unsigned long lastBtnTime = 0;
 const unsigned long debounceMs = 120;
+bool lastResetBtnState = HIGH;
 
 // 馬達
 #define STEP_PIN 14
@@ -105,6 +106,11 @@ uint16_t cbSetTargetPos(TRegister* reg, uint16_t val) {
   uint16_t high = mb.Hreg(HR_MOV_H);
   uint16_t low  = val;
   int32_t newStep = combineToInt32(high, low);
+  if (digitalRead(RESETBTN) == LOW && newStep < stepper.currentPosition()) {
+    Serial.println("[MODBUS BLOCK] Reset button pressed, ignore UP command");
+    // 可以選擇不執行 moveTo，或強制設回當前位置
+    return val; 
+  }
   stepper.moveTo(newStep);
   Serial.printf("[CMD] MoveTo step=%ld\n", newStep);
   return val;
@@ -158,24 +164,24 @@ bool aqua_waked = false;
 
 volatile int currentSensor = 0;
 
+// 讀取模式
+enum AquaReadMode {
+  READ_ALL = 0,
+  READ_DEPTH = 1
+};
+
+AquaReadMode currentReadMode = READ_ALL;
+
 // 暫存器定義
 enum {
-  IR_AQ_TEMP_H = 20, // 40008: Aqua 溫度 高16位
-  IR_AQ_TEMP_L,     // 40009: Aqua 溫度 低16位
-  IR_AQ_PRES_H,     // 40010: Aqua 壓力 高16位
-  IR_AQ_PRES_L,     // 40011: Aqua 壓力 低16位
-  IR_AQ_DEPTH_H,    // 40012: Aqua 深度 高16位
-  IR_AQ_DEPTH_L,    // 40013: Aqua 深度 低16
-  IR_AQ_LEVEL_H,    // 40014: Aqua 水位 高16位
-  IR_AQ_LEVEL_L,    // 40015: Aqua 水位 低16
-  IR_AQ_ALCON_H,    // 40016: Aqua 實際導電率 高16位
-  IR_AQ_ALCON_L,    // 40017: Aqua 實際導電率 低16位
-  IR_AQ_SCON_H,    // 40018: Aqua 特定導電率 高16位
-  IR_AQ_SCON_L,    // 40019: Aqua 特定導電率 低16位
-  IR_AQ_RESIS_H,   // 40020: Aqua 電阻率 高16位
-  IR_AQ_RESIS_L,   // 40021: Aqua 電阻率 低16位
-  IR_AQ_SALIN_H,   // 40022: Aqua 鹽度 高16位
-  
+  IR_AQ_READMODE = 19, // 40019: Aqua 讀取模式
+  IR_AQ_TEMP_H = 20, // 40020: Aqua 溫度 高16位
+  IR_AQ_TEMP_L,     // 40021: Aqua 溫度 低16位
+  IR_AQ_PRES_H,     // 40022: Aqua 壓力 高16位
+  IR_AQ_PRES_L,     // 40023: Aqua 壓力 低16位
+  IR_AQ_DEPTH_H,    // 40024: Aqua 深度 高16位
+  IR_AQ_DEPTH_L,    // 40025: Aqua 深度 低16
+  // ... 其他感測器暫存器依序類推，最高到 40061 (20個感測器 * 2個reg/感測器 = 40個reg)
 };
 
 // Aqua 各感測器寄存器讀取指令
@@ -246,6 +252,8 @@ void wakeupAqua() {
         gotResponse = true;
         break;
       }
+      Serial.print("."); // Indicate waiting
+      delay(100);
     }
 
     if (gotResponse) {
@@ -315,41 +323,47 @@ void aquaTask(void *pv) {
   }
   unsigned long start = millis();
   for (;;) {
-    float value = 0.0;
-    if (readAquaRegister(currentSensor, value)) {
-      Serial.print("[AquaTask] Sensor Index ");
-      Serial.print(currentSensor);
-      Serial.print(" → Value: ");
+    if(currentReadMode == READ_DEPTH){
+      currentSensor = 2; // depth sensor index
+      float value = 0.0;
+      readAquaRegister(currentSensor, value);
+      Serial.print("[AquaTask] Depth Value: ");
       Serial.println(value, 4); // 4 decimal places
-    } else {
-      Serial.print("[AquaTask] Sensor Index ");
-      Serial.print(currentSensor);
-      Serial.println(" → ❌ Failed to read");
-    }
-    currentSensor = (currentSensor + 1) % AQUA_SENSOR_COUNT;
-    //delay(100); // wait before next sensor read
-    if(currentSensor == 0){
-      unsigned long operation_time = millis()-start;
-      start = millis();
-      Serial.print("[AquaTask] Loop operation time: ");
-      Serial.print(operation_time);
-      Serial.println(" ms");
-      // print aqua input buffer raw data in hex
-      Serial.println("Aqua Input Buffer (Hex):");
-      if (xSemaphoreTake(aquaMutex, (TickType_t)10 / portTICK_PERIOD_MS) == pdTRUE){ 
-        for(int i=0;i<AQUA_SENSOR_COUNT;i++){
-          Serial.printf("%f ", AquaInputBuff[i]);
-          if((i+1)%8==0) Serial.println();
-          vTaskDelay(10 / portTICK_PERIOD_MS); // 讓出 CPU
-        }
-        xSemaphoreGive(aquaMutex);
+      vTaskDelay(10 / portTICK_PERIOD_MS); // wait before next read
+    }else{
+      float value = 0.0;
+      if (readAquaRegister(currentSensor, value)) {
+        Serial.print("[AquaTask] Sensor Index ");
+        Serial.print(currentSensor);
+        Serial.print(" → Value: ");
+        Serial.println(value, 4); // 4 decimal places
+      } else {
+        Serial.print("[AquaTask] Sensor Index ");
+        Serial.print(currentSensor);
+        Serial.println(" → ❌ Failed to read");
       }
-      
+      currentSensor = (currentSensor + 1) % AQUA_SENSOR_COUNT;
+      //delay(100); // wait before next sensor read
+      if(currentSensor == 0){
+        unsigned long operation_time = millis()-start;
+        start = millis();
+        Serial.print("[AquaTask] Loop operation time: ");
+        Serial.print(operation_time);
+        Serial.println(" ms");
+        // print aqua input buffer raw data in hex
+        Serial.println("Aqua Input Buffer (Hex):");
+        if (xSemaphoreTake(aquaMutex, (TickType_t)10 / portTICK_PERIOD_MS) == pdTRUE){ 
+          for(int i=0;i<AQUA_SENSOR_COUNT;i++){
+            Serial.printf("%f ", AquaInputBuff[i]);
+            if((i+1)%8==0) Serial.println();
+            vTaskDelay(10 / portTICK_PERIOD_MS); // 讓出 CPU
+          }
+          xSemaphoreGive(aquaMutex);
+        }
+        
+      }
     }
-    
   }
-    
-
 }
   
 
@@ -386,6 +400,7 @@ void setup() {
   mb.addIreg(IR_POS_L, 0);
   mb.addIreg(IR_RUN_STATE, 0);
   // 新增 Aqua 感測器暫存器, offset 20, 每個sensor有兩個reg, 分別為高16位和低16位
+  mb.addIreg(IR_AQ_READMODE, 0);
   for(int i=0;i<AQUA_SENSOR_COUNT;i++){
     //高位
     mb.addIreg(AquaIregOffset + i*2, 0);
@@ -426,6 +441,7 @@ void setup() {
 void handleButtons() {
   unsigned long now = millis();
   if (now - lastBtnTime < debounceMs) return;
+  bool currentResetBtnState = digitalRead(RESETBTN);
   if (digitalRead(UPBTN) == LOW) {   // 按下 UP
     lastBtnTime = now;
     if(winchState != WinchState::RUN_UP){
@@ -450,15 +466,20 @@ void handleButtons() {
     lastBtnTime = now;
     if(winchState != WinchState::STOPPED){
       stepper.setCurrentPosition(stepper.currentPosition()); // 硬停
+      // 同步暫存器，避免按鈕衝突後資料不同步，設定為0
+      mb.Hreg(HR_MOV_H, 0);
+      mb.Hreg(HR_MOV_L, 0);
       Serial.println("[BUTTON] Motor STOP");
     }
-  } else if (digitalRead(RESETBTN) == LOW) { // Reset
+  } else if (currentResetBtnState == LOW && lastResetBtnState == HIGH) { // 避免連續觸發，只有在按鈕從未按下變為按下的瞬間才觸發
     lastBtnTime = now;
     if(stepper.currentPosition()!=0){
       Serial.println("[BUTTON] RESET position to 0");
       stepper.setCurrentPosition(0);
     }
   }
+
+  lastResetBtnState = currentResetBtnState;
 }
 
 void loop() {
@@ -484,6 +505,7 @@ void loop() {
     Serial.println("[SAFETY] Tension below threshold, Motor STOP");
   }
 
+
   // 更新 Input Register
   uint32_t tens_raw = (uint32_t)currentTension;
   mb.Ireg(IR_TEN_H, (uint16_t)((tens_raw >> 16) & 0xFFFF));
@@ -496,6 +518,7 @@ void loop() {
 
 
   // 更新所有的 Aqua 感測器暫存器 from float buffer using safe memcpy
+  mb.Ireg(IR_AQ_READMODE, (uint16_t)currentReadMode);
   if (xSemaphoreTake(aquaMutex, (TickType_t)5 / portTICK_PERIOD_MS) == pdTRUE) {
     for (int i = 0; i < AQUA_SENSOR_COUNT; i++) {
       uint32_t raw;
