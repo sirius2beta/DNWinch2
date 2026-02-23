@@ -12,10 +12,11 @@
 #define UART2_RX 16
 
 // Buttons
-#define UPBTN    18
-#define DOWNBTN  21
+#define UPBTN    21
+#define DOWNBTN  18
 #define STOPBTN  19
 #define RESETBTN 13
+#define TENSIONBTN 32
 
 unsigned long lastBtnTime = 0;
 const unsigned long debounceMs = 120;
@@ -41,6 +42,9 @@ HX711 scale;
 
 int32_t currentTension = 0;
 int32_t tensionThreshold = 0;
+
+// tension state
+bool tensionHigh = false;
 
 // Modbus
 HardwareSerial MainBus(2);
@@ -423,6 +427,7 @@ void setup() {
   pinMode(DOWNBTN, INPUT_PULLUP);
   pinMode(STOPBTN, INPUT_PULLUP);
   pinMode(RESETBTN, INPUT_PULLUP);
+  pinMode(TENSIONBTN, INPUT_PULLUP);
 
   // 馬達初始化
   stepper.setMaxSpeed(2000);
@@ -450,7 +455,7 @@ void handleButtons() {
         Serial.println("[BUTTON] Motor STOP");
       }
       Serial.println("[BUTTON] Motor run UP");
-      stepper.move(1000000);
+      stepper.move(-1000000);
     }
   } else if (digitalRead(DOWNBTN) == LOW) {  // 按下 DOWN
     lastBtnTime = now;
@@ -460,15 +465,12 @@ void handleButtons() {
         Serial.println("[BUTTON] Motor STOP");
       }
       Serial.println("[BUTTON] Motor run DOWN");
-      stepper.move(-1000000);
+      stepper.move(1000000);
     }
   } else if (digitalRead(STOPBTN) == LOW) {  // 按下 STOP
     lastBtnTime = now;
     if(winchState != WinchState::STOPPED){
       stepper.setCurrentPosition(stepper.currentPosition()); // 硬停
-      // 同步暫存器，避免按鈕衝突後資料不同步，設定為0
-      mb.Hreg(HR_MOV_H, 0);
-      mb.Hreg(HR_MOV_L, 0);
       Serial.println("[BUTTON] Motor STOP");
     }
   } else if (currentResetBtnState == LOW && lastResetBtnState == HIGH) { // 避免連續觸發，只有在按鈕從未按下變為按下的瞬間才觸發
@@ -477,6 +479,11 @@ void handleButtons() {
       Serial.println("[BUTTON] RESET position to 0");
       stepper.setCurrentPosition(0);
     }
+  }
+  if(digitalRead(TENSIONBTN) == LOW) {  // 按下 TENSION
+    tensionHigh = true;
+  }else{
+    tensionHigh = false;
   }
 
   lastResetBtnState = currentResetBtnState;
@@ -492,15 +499,17 @@ void loop() {
 
   if(stepper.distanceToGo()!=0){
     if(stepper.targetPosition()>stepper.currentPosition()){
-      winchState = WinchState::RUN_UP;
-    } else {
       winchState = WinchState::RUN_DOWN;
+    } else {
+      winchState = WinchState::RUN_UP;
     }
+    currentReadMode = READ_DEPTH; // 運行時只讀取深度感測器
   } else {
     winchState = WinchState::STOPPED;
+    currentReadMode = READ_ALL; // 停止時讀取全部感測器
   }
   //如果 tension<tension threshold，不可下降
-  if(winchState == WinchState::RUN_DOWN && currentTension<tensionThreshold){
+  if(winchState == WinchState::RUN_DOWN && !tensionHigh){
     stepper.setCurrentPosition(stepper.currentPosition());
     Serial.println("[SAFETY] Tension below threshold, Motor STOP");
   }
