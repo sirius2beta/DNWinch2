@@ -18,6 +18,7 @@
 #define RESETBTN 13
 #define TENSIONBTN 32
 
+bool isAutoCompensating = false; // 新增：是否處於自動補償上捲狀態
 unsigned long lastBtnTime = 0;
 const unsigned long debounceMs = 120;
 bool lastResetBtnState = HIGH;
@@ -72,6 +73,7 @@ enum {
   IR_POS_H,           // 30008: currentPosition 高16位
   IR_POS_L,           // 30009: currentPosition 低16位
   IR_RUN_STATE,      // 30010: Motor Run State (0xFF=running, 0x00=stopped)
+  IR_TENSION_BTN     //30011
 };
 
 enum {
@@ -403,6 +405,7 @@ void setup() {
   mb.addIreg(IR_POS_H, 0);
   mb.addIreg(IR_POS_L, 0);
   mb.addIreg(IR_RUN_STATE, 0);
+  mb.addIreg(IR_TENSION_BTN, 0);
   // 新增 Aqua 感測器暫存器, offset 20, 每個sensor有兩個reg, 分別為高16位和低16位
   mb.addIreg(IR_AQ_READMODE, 0);
   for(int i=0;i<AQUA_SENSOR_COUNT;i++){
@@ -507,11 +510,19 @@ void loop() {
   } else {
     winchState = WinchState::STOPPED;
     currentReadMode = READ_ALL; // 停止時讀取全部感測器
+    if(isAutoCompensating){
+      Serial.println("[SAFETY] Auto Retract Finished (Tension Restored)");
+      isAutoCompensating = false; // 新增：是否處於自動補償上捲狀態
+    }
+    
   }
   //如果 tension<tension threshold，不可下降
   if(winchState == WinchState::RUN_DOWN && !tensionHigh){
-    stepper.setCurrentPosition(stepper.currentPosition());
-    Serial.println("[SAFETY] Tension below threshold, Motor STOP");
+    //stepper.setCurrentPosition(stepper.currentPosition());
+    //Serial.println("[SAFETY] Tension below threshold, Motor STOP");
+    //isAutoCompensating = true; 
+    //stepper.move(-5000);
+    
   }
 
 
@@ -524,6 +535,7 @@ void loop() {
   mb.Ireg(IR_POS_H, (uint16_t)((pos_raw >> 16) & 0xFFFF));
   mb.Ireg(IR_POS_L, (uint16_t)(pos_raw & 0xFFFF));
   mb.Ireg(IR_RUN_STATE, (stepper.distanceToGo() != 0) ? 0xFF : 0x00);
+  mb.Ireg(IR_TENSION_BTN, tensionHigh);
 
 
   // 更新所有的 Aqua 感測器暫存器 from float buffer using safe memcpy
